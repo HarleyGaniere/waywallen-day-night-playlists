@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 HarleyGaniere
 """waywallen-day-night-playlists: switch Waywallen playlists with the light/dark theme.
 
     waywallen-day-night-playlists list

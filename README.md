@@ -107,3 +107,9 @@ Or add the `watch` command to your compositor's startup (for example `exec` in S
 ## How It Works
 
 The script finds Waywallen's control port on D-Bus (`org.waywallen.waywallen.Daemon`), then talks to the daemon over its WebSocket control protocol, the same one the Waywallen app uses. It watches the portal's `SettingChanged` signal for color-scheme changes and the screensaver's `ActiveChanged` signal for lock/unlock.
+
+## License
+
+Copyright (C) 2026 HarleyGaniere
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [`LICENSE`](LICENSE) for the full text.
