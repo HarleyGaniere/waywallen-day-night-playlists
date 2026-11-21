@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""waywallen-theme-playlists: switch Waywallen playlists with the light/dark theme.
+
+    waywallen-theme-playlists list
+        Show your playlists and their ids.
+    waywallen-theme-playlists activate <name-or-id>
+        Activate one playlist now.
+    waywallen-theme-playlists watch --light <name-or-id> --dark <name-or-id>
+        Activate the matching playlist now and every time the theme changes.
+
+The theme comes from the desktop portal's color-scheme setting, which Plasma
+updates whenever the color scheme switches between light and dark, including
+its automatic day/night switching. Talks to the Waywallen daemon over its own
+control socket (port found via D-Bus). Needs only Python and gdbus (glib2).
+"""
+import argparse
+import base64
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+DAEMON_BUS = "org.waywallen.waywallen.Daemon"
+DAEMON_PATH = "/org/waywallen/waywallen/Daemon"
+DAEMON_IFACE = "org.waywallen.waywallen.Daemon1"
+PORTAL_BUS = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+
+# control.proto field numbers
+REQ_ID = 1
+REQ_PLAYLIST_LIST = 30
+REQ_PLAYLIST_ACTIVATE = 37
+FRAME_RESPONSE = 1
+RESP_ID, RESP_STATUS, RESP_MESSAGE = 1, 2, 3
+RESP_PLAYLIST_LIST = 30
+STATUS_OK = 1
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# --------------------------------------------------------------------------
+# Minimal protobuf
+# --------------------------------------------------------------------------
+def varint(n):
+    n &= (1 << 64) - 1
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def field_varint(num, value):
+    return varint(num << 3) + varint(value)
+
+
+def field_bytes(num, data):
+    return varint((num << 3) | 2) + varint(len(data)) + data
+
+
+def parse(data):
+    """Yields (field, wire_type, value) for one message level."""
+    i = 0
+    while i < len(data):
+        key, i = read_varint(data, i)
+        num, wt = key >> 3, key & 7
+        if wt == 0:
+            v, i = read_varint(data, i)
+        elif wt == 1:
+            v, i = data[i:i + 8], i + 8
+        elif wt == 2:
+            n, i = read_varint(data, i)
+            v, i = data[i:i + n], i + n
+        elif wt == 5:
+            v, i = data[i:i + 4], i + 4
+        else:
+            raise ValueError(f"unsupported wire type {wt}")
+        yield num, wt, v
+
+
+def read_varint(data, i):
+    shift = result = 0
+    while True:
+        b = data[i]
+        i += 1
+        result |= (b & 0x7F) << shift
+        if not b & 0x80:
+            return result, i
+        shift += 7
+
+
+# --------------------------------------------------------------------------
+# Minimal WebSocket client
+# --------------------------------------------------------------------------
+class WebSocket:
+    def __init__(self, port):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=15)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((
+            f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("daemon closed the connection")
+            head += chunk
+        head, self.buf = head.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise ConnectionError("websocket handshake failed")
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("daemon closed the connection")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, payload, opcode=2):
+        mask = os.urandom(4)
+        n = len(payload)
+        if n < 126:
+            head = struct.pack("!BB", 0x80 | opcode, 0x80 | n)
+        elif n < 65536:
+            head = struct.pack("!BBH", 0x80 | opcode, 0xFE, n)
+        else:
+            head = struct.pack("!BBQ", 0x80 | opcode, 0xFF, n)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(head + mask + masked)
+
+    def recv(self):
+        message = b""
+        while True:
+            b0, b1 = self._read(2)
+            fin, opcode, n = b0 & 0x80, b0 & 0x0F, b1 & 0x7F
+            if n == 126:
+                n = struct.unpack("!H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack("!Q", self._read(8))[0]
+            mask = self._read(4) if b1 & 0x80 else None
+            data = self._read(n)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if opcode == 8:
+                raise ConnectionError("daemon closed the connection")
+            if opcode == 9:
+                self.send(data, opcode=10)
+                continue
+            if opcode == 10:
+                continue
+            message += data
+            if fin:
+                return message
+
+    def close(self):
+        try:
+            self.send(b"", opcode=8)
+        except OSError:
+            pass
+        self.sock.close()
+
+
+# --------------------------------------------------------------------------
+# Waywallen control
+# --------------------------------------------------------------------------
+def gdbus(*args):
+    return subprocess.run(["gdbus", *args], capture_output=True, text=True)
+
+
+def daemon_port():
+    r = gdbus("call", "--session", "--dest", DAEMON_BUS, "--object-path", DAEMON_PATH,
+              "--method", "org.freedesktop.DBus.Properties.Get", DAEMON_IFACE, "WsPort")
+    m = re.search(r"uint16 (\d+)", r.stdout)
+    if r.returncode != 0 or not m or int(m.group(1)) == 0:
+        raise ConnectionError("Waywallen daemon isn't running")
+    return int(m.group(1))
+
+
+class Client:
+    def __init__(self):
+        self.ws = WebSocket(daemon_port())
+        self.next_id = int(time.time()) % 1_000_000 * 1000
+
+    def call(self, field, body=b""):
+        self.next_id += 1
+        rid = self.next_id
+        self.ws.send(field_varint(REQ_ID, rid) + field_bytes(field, body))
+        while True:  # skip events until our response arrives
+            for num, _, frame in parse(self.ws.recv()):
+                if num != FRAME_RESPONSE:
+                    continue
+                resp = {n: v for n, _, v in parse(frame)}
+                if resp.get(RESP_ID) != rid:
+                    continue
+                if resp.get(RESP_STATUS, STATUS_OK) != STATUS_OK:
+                    msg = resp.get(RESP_MESSAGE, b"").decode(errors="replace")
+                    raise RuntimeError(msg or "request failed")
+                return resp
+
+    def playlists(self):
+        resp = self.call(REQ_PLAYLIST_LIST)
+        out = []
+        for num, _, item in parse(resp.get(RESP_PLAYLIST_LIST, b"")):
+            if num == 1:
+                f = {n: v for n, _, v in parse(item)}
+                pid = f.get(1, 0)
+                if pid >= 1 << 63:
+                    pid -= 1 << 64
+                out.append((pid, f.get(2, b"").decode(errors="replace"), f.get(6, 0)))
+        return out
+
+    def activate(self, pid):
+        # id = 1, auto_attach = 3 (also restore this playlist on restart/new displays)
+        self.call(REQ_PLAYLIST_ACTIVATE, field_varint(1, pid) + field_varint(3, 1))
+
+    def close(self):
+        self.ws.close()
+
+
+def resolve(client, wanted):
+    lists = client.playlists()
+    for pid, name, _ in lists:
+        if str(pid) == wanted or name.lower() == wanted.lower():
+            return pid, name
+    names = ", ".join(f'"{n}"' for _, n, _ in lists) or "none"
+    raise RuntimeError(f'No playlist "{wanted}". Playlists: {names}')
+
+
+def activate(wanted):
+    c = Client()
+    try:
+        pid, name = resolve(c, wanted)
+        c.activate(pid)
+        return name
+    finally:
+        c.close()
+
+
+# --------------------------------------------------------------------------
+# Theme
+# --------------------------------------------------------------------------
+def current_scheme():
+    r = gdbus("call", "--session", "--dest", PORTAL_BUS, "--object-path", PORTAL_PATH,
+              "--method", "org.freedesktop.portal.Settings.ReadOne",
+              "org.freedesktop.appearance", "color-scheme")
+    if r.returncode != 0:
+        r = gdbus("call", "--session", "--dest", PORTAL_BUS, "--object-path", PORTAL_PATH,
+                  "--method", "org.freedesktop.portal.Settings.Read",
+                  "org.freedesktop.appearance", "color-scheme")
+    m = re.search(r"uint32 (\d+)", r.stdout)
+    return "dark" if m and m.group(1) == "1" else "light"
+
+
+def apply_scheme(scheme, light, dark, retries=30):
+    target = dark if scheme == "dark" else light
+    for attempt in range(retries):
+        try:
+            name = activate(target)
+            log(f"{scheme} theme -> playlist \"{name}\"")
+            return
+        except (ConnectionError, OSError) as e:
+            if attempt == 0:
+                log(f"Waiting for Waywallen ({e})...")
+            time.sleep(2)
+        except RuntimeError as e:
+            log(f"Error: {e}")
+            return
+    log("Gave up waiting for Waywallen.")
+
+
+def watch(light, dark):
+    scheme = current_scheme()
+    apply_scheme(scheme, light, dark)
+    while True:
+        mon = subprocess.Popen(
+            ["gdbus", "monitor", "--session", "--dest", PORTAL_BUS,
+             "--object-path", PORTAL_PATH],
+            stdout=subprocess.PIPE, text=True, bufsize=1)
+        for line in mon.stdout:
+            if "SettingChanged" in line and "'color-scheme'" in line:
+                m = re.search(r"uint32 (\d+)", line)
+                new = "dark" if m and m.group(1) == "1" else "light"
+                if new != scheme:
+                    scheme = new
+                    apply_scheme(scheme, light, dark)
+        mon.wait()
+        log("Portal monitor stopped; restarting in 5s")
+        time.sleep(5)
+        new = current_scheme()
+        if new != scheme:
+            scheme = new
+            apply_scheme(scheme, light, dark)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog=os.path.basename(sys.argv[0]),
+                                 description="Switch Waywallen playlists with the light/dark theme.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list", help="show playlists")
+    a = sub.add_parser("activate", help="activate a playlist now")
+    a.add_argument("playlist", help="playlist name or id")
+    w = sub.add_parser("watch", help="follow the light/dark theme")
+    w.add_argument("--light", required=True, help="playlist for the light theme")
+    w.add_argument("--dark", required=True, help="playlist for the dark theme")
+    args = ap.parse_args()
+
+    try:
+        if args.cmd == "list":
+            c = Client()
+            try:
+                rows = c.playlists()
+            finally:
+                c.close()
+            if not rows:
+                print("No playlists yet. Create them in Waywallen first.")
+            for pid, name, count in rows:
+                print(f"{pid:>4}  {name}  ({count} wallpapers)")
+            print(f"\nCurrent theme: {current_scheme()}")
+        elif args.cmd == "activate":
+            print(f'Activated "{activate(args.playlist)}"')
+        else:
+            watch(args.light, args.dark)
+    except (ConnectionError, OSError, RuntimeError) as e:
+        sys.exit(f"Error: {e}")
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
