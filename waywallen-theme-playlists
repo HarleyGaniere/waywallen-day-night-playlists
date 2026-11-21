@@ -16,11 +16,13 @@ control socket (port found via D-Bus). Needs only Python and gdbus (glib2).
 import argparse
 import base64
 import os
+import queue
 import re
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 DAEMON_BUS = "org.waywallen.waywallen.Daemon"
@@ -28,6 +30,9 @@ DAEMON_PATH = "/org/waywallen/waywallen/Daemon"
 DAEMON_IFACE = "org.waywallen.waywallen.Daemon1"
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
+SCREENSAVER_BUS = "org.freedesktop.ScreenSaver"
+SCREENSAVER_PATH = "/org/freedesktop/ScreenSaver"
+UNLOCK_SETTLE_SECONDS = 3
 
 # control.proto field numbers
 REQ_ID = 1
@@ -280,28 +285,75 @@ def apply_scheme(scheme, light, dark, retries=30):
     log("Gave up waiting for Waywallen.")
 
 
-def watch(light, dark):
-    scheme = current_scheme()
-    apply_scheme(scheme, light, dark)
+def screen_locked():
+    r = gdbus("call", "--session", "--dest", SCREENSAVER_BUS, "--object-path", SCREENSAVER_PATH,
+              "--method", "org.freedesktop.ScreenSaver.GetActive")
+    return "true" in r.stdout
+
+
+def monitor(dest, path, kind, events):
+    """Feed lines from 'gdbus monitor' into the queue, restarting if it exits."""
     while True:
-        mon = subprocess.Popen(
-            ["gdbus", "monitor", "--session", "--dest", PORTAL_BUS,
-             "--object-path", PORTAL_PATH],
-            stdout=subprocess.PIPE, text=True, bufsize=1)
+        mon = subprocess.Popen(["gdbus", "monitor", "--session", "--dest", dest,
+                                "--object-path", path],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               text=True, bufsize=1)
         for line in mon.stdout:
-            if "SettingChanged" in line and "'color-scheme'" in line:
+            events.put((kind, line))
+        mon.wait()
+        time.sleep(5)
+        events.put((kind, None))  # monitor restarted: re-check state
+
+
+def watch(light, dark):
+    # While the screen is locked the monitors are often off, and Waywallen has
+    # no displays to switch. A playlist activated then doesn't stick: when the
+    # displays come back they restore the playlist they had before. So a theme
+    # change during the lock is held until unlock and applied then.
+    events = queue.Queue()
+    threading.Thread(target=monitor, args=(PORTAL_BUS, PORTAL_PATH, "theme", events),
+                     daemon=True).start()
+    threading.Thread(target=monitor, args=(SCREENSAVER_BUS, SCREENSAVER_PATH, "lock", events),
+                     daemon=True).start()
+
+    scheme = current_scheme()
+    locked = screen_locked()
+    pending = locked
+    if locked:
+        log(f"{scheme} theme; screen is locked, will switch after unlock")
+    else:
+        apply_scheme(scheme, light, dark)
+
+    while True:
+        kind, line = events.get()
+        if kind == "theme":
+            if line is not None and not ("SettingChanged" in line and "'color-scheme'" in line):
+                continue
+            if line is None:
+                new = current_scheme()
+            else:
                 m = re.search(r"uint32 (\d+)", line)
                 new = "dark" if m and m.group(1) == "1" else "light"
-                if new != scheme:
-                    scheme = new
-                    apply_scheme(scheme, light, dark)
-        mon.wait()
-        log("Portal monitor stopped; restarting in 5s")
-        time.sleep(5)
-        new = current_scheme()
-        if new != scheme:
+            if new == scheme:
+                continue
             scheme = new
-            apply_scheme(scheme, light, dark)
+            if locked:
+                pending = True
+                log(f"{scheme} theme while locked; will switch after unlock")
+            else:
+                apply_scheme(scheme, light, dark)
+        else:
+            if line is not None and "ActiveChanged" not in line:
+                continue
+            now_locked = screen_locked() if line is None else "true" in line
+            if now_locked == locked:
+                continue
+            locked = now_locked
+            if not locked and pending:
+                pending = False
+                time.sleep(UNLOCK_SETTLE_SECONDS)  # let the displays come back first
+                scheme = current_scheme()
+                apply_scheme(scheme, light, dark)
 
 
 def main():
