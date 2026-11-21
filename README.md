@@ -1,4 +1,4 @@
-# Waywallen Theme Playlists
+# Waywallen Day/Night Playlists
 
 Switches [Waywallen](https://github.com/waywallen/waywallen) playlists with your light/dark theme: one playlist for light, another for dark.
 
@@ -10,21 +10,21 @@ The theme is read from the desktop portal's `color-scheme` setting, so it follow
 ./install.sh
 ```
 
-Then put your playlist names in `~/.config/systemd/user/waywallen-theme-playlists.service` and enable it:
+Then put your playlist names in `~/.config/systemd/user/waywallen-day-night-playlists.service` and enable it:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now waywallen-theme-playlists.service
+systemctl --user enable --now waywallen-day-night-playlists.service
 ```
 
 ## Usage
 
 ```bash
-waywallen-theme-playlists list                              # playlists and their ids
-waywallen-theme-playlists activate "Night"                  # activate one now
-waywallen-theme-playlists watch --light "Day" --dark "Night"
+waywallen-day-night-playlists list                              # playlists and their ids
+waywallen-day-night-playlists activate "Night"                  # activate one now
+waywallen-day-night-playlists watch --light "Day" --dark "Night"
 ```
 
 Activating a playlist also makes it Waywallen's auto-attach playlist, so the right one comes back after a restart or on a new display.
 
-Logs: `journalctl --user -u waywallen-theme-playlists -f`
+Logs: `journalctl --user -u waywallen-day-night-playlists -f`

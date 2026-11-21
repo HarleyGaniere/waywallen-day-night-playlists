@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""waywallen-theme-playlists: switch Waywallen playlists with the light/dark theme.
+"""waywallen-day-night-playlists: switch Waywallen playlists with the light/dark theme.
 
-    waywallen-theme-playlists list
+    waywallen-day-night-playlists list
         Show your playlists and their ids.
-    waywallen-theme-playlists activate <name-or-id>
+    waywallen-day-night-playlists activate <name-or-id>
         Activate one playlist now.
-    waywallen-theme-playlists watch --light <name-or-id> --dark <name-or-id>
+    waywallen-day-night-playlists watch --light <name-or-id> --dark <name-or-id>
         Activate the matching playlist now and every time the theme changes.
 
 The theme comes from the desktop portal's color-scheme setting, which Plasma
