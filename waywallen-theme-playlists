@@ -33,6 +33,7 @@ PORTAL_PATH = "/org/freedesktop/portal/desktop"
 SCREENSAVER_BUS = "org.freedesktop.ScreenSaver"
 SCREENSAVER_PATH = "/org/freedesktop/ScreenSaver"
 UNLOCK_SETTLE_SECONDS = 3
+THEME_SETTLE_SECONDS = 3
 
 # control.proto field numbers
 REQ_ID = 1
@@ -306,6 +307,11 @@ def monitor(dest, path, kind, events):
 
 
 def watch(light, dark):
+    # Applying a global theme makes Plasma announce the color scheme several
+    # times in a row, often dark-then-light, so a change is only acted on once
+    # it has been stable for THEME_SETTLE_SECONDS, and then the current value
+    # is read fresh.
+    #
     # While the screen is locked the monitors are often off, and Waywallen has
     # no displays to switch. A playlist activated then doesn't stick: when the
     # displays come back they restore the playlist they had before. So a theme
@@ -316,32 +322,29 @@ def watch(light, dark):
     threading.Thread(target=monitor, args=(SCREENSAVER_BUS, SCREENSAVER_PATH, "lock", events),
                      daemon=True).start()
 
-    scheme = current_scheme()
+    applied = None      # scheme whose playlist is active
     locked = screen_locked()
-    pending = locked
-    if locked:
-        log(f"{scheme} theme; screen is locked, will switch after unlock")
-    else:
-        apply_scheme(scheme, light, dark)
+    deadline = time.monotonic()  # check right away at startup
 
     while True:
-        kind, line = events.get()
-        if kind == "theme":
-            if line is not None and not ("SettingChanged" in line and "'color-scheme'" in line):
+        timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+        try:
+            kind, line = events.get(timeout=timeout)
+        except queue.Empty:
+            deadline = None
+            scheme = current_scheme()
+            if scheme == applied:
                 continue
-            if line is None:
-                new = current_scheme()
-            else:
-                m = re.search(r"uint32 (\d+)", line)
-                new = "dark" if m and m.group(1) == "1" else "light"
-            if new == scheme:
-                continue
-            scheme = new
             if locked:
-                pending = True
                 log(f"{scheme} theme while locked; will switch after unlock")
-            else:
-                apply_scheme(scheme, light, dark)
+                continue
+            apply_scheme(scheme, light, dark)
+            applied = scheme
+            continue
+
+        if kind == "theme":
+            if line is None or ("SettingChanged" in line and "'color-scheme'" in line):
+                deadline = time.monotonic() + THEME_SETTLE_SECONDS
         else:
             if line is not None and "ActiveChanged" not in line:
                 continue
@@ -349,11 +352,9 @@ def watch(light, dark):
             if now_locked == locked:
                 continue
             locked = now_locked
-            if not locked and pending:
-                pending = False
-                time.sleep(UNLOCK_SETTLE_SECONDS)  # let the displays come back first
-                scheme = current_scheme()
-                apply_scheme(scheme, light, dark)
+            if not locked:
+                # let the displays come back, then catch up on any change
+                deadline = time.monotonic() + UNLOCK_SETTLE_SECONDS
 
 
 def main():
