@@ -43,6 +43,8 @@ waywallen-day-night-playlists watch --light "Day" --dark "Night"
 
 Logs: `journalctl --user -u waywallen-day-night-playlists -f`
 
+Both playlists need at least one wallpaper. An empty playlist is skipped (with an error in the log) instead of activated, because activating an empty playlist can crash Waywallen.
+
 ## Light/Dark Indicator
 
 The script reads the `org.freedesktop.appearance` `color-scheme` setting from the desktop portal: `1` means dark, `0` (no preference) or `2` means light. Check what your system reports:

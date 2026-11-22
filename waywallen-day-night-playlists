@@ -239,8 +239,12 @@ class Client:
 
 def resolve(client, wanted):
     lists = client.playlists()
-    for pid, name, _ in lists:
+    for pid, name, count in lists:
         if str(pid) == wanted or name.lower() == wanted.lower():
+            if count == 0:
+                # Activating an empty playlist can crash Waywallen, so refuse.
+                raise RuntimeError(f'Playlist "{name}" has no wallpapers; not switching to it. '
+                                   'Add wallpapers to it and switch themes again.')
             return pid, name
     names = ", ".join(f'"{n}"' for _, n, _ in lists) or "none"
     raise RuntimeError(f'No playlist "{wanted}". Playlists: {names}')
