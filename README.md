@@ -39,7 +39,11 @@ systemctl --user enable --now waywallen-day-night-playlists.service
 waywallen-day-night-playlists list                              # playlists, their ids, and the current theme
 waywallen-day-night-playlists activate "Night"                  # activate one now
 waywallen-day-night-playlists watch --light "Day" --dark "Night"
+waywallen-day-night-playlists --disable                         # stop switching (also at login)
+waywallen-day-night-playlists --enable                          # switch again (now and at login)
 ```
+
+`--disable` and `--enable` turn the login service off or on. Your playlist names in the service file are kept, so `--enable` picks up where you left off.
 
 Logs: `journalctl --user -u waywallen-day-night-playlists -f`
 

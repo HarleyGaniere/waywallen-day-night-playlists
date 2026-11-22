@@ -9,6 +9,10 @@
         Activate one playlist now.
     waywallen-day-night-playlists watch --light <name-or-id> --dark <name-or-id>
         Activate the matching playlist now and every time the theme changes.
+    waywallen-day-night-playlists --disable
+        Stop switching playlists: stop the login service and don't start it again.
+    waywallen-day-night-playlists --enable
+        Start switching again: start the login service and run it at every login.
 
 The theme comes from the desktop portal's color-scheme setting, which Plasma
 updates whenever the color scheme switches between light and dark, including
@@ -34,6 +38,7 @@ PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
 SCREENSAVER_BUS = "org.freedesktop.ScreenSaver"
 SCREENSAVER_PATH = "/org/freedesktop/ScreenSaver"
+SERVICE = "waywallen-day-night-playlists.service"
 UNLOCK_SETTLE_SECONDS = 3
 THEME_SETTLE_SECONDS = 3
 
@@ -363,10 +368,27 @@ def watch(light, dark):
                 deadline = time.monotonic() + UNLOCK_SETTLE_SECONDS
 
 
+def set_service(enable):
+    action = "enable" if enable else "disable"
+    r = subprocess.run(["systemctl", "--user", action, "--now", SERVICE])
+    if r.returncode != 0:
+        sys.exit(f"Error: couldn't {action} {SERVICE}")
+    if enable:
+        print("Enabled: playlists follow the light/dark theme again, now and at every login.")
+    else:
+        print("Disabled: playlists no longer follow the theme. "
+              "Turn it back on with --enable.")
+
+
 def main():
     ap = argparse.ArgumentParser(prog=os.path.basename(sys.argv[0]),
                                  description="Switch Waywallen playlists with the light/dark theme.")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    toggle = ap.add_mutually_exclusive_group()
+    toggle.add_argument("--disable", action="store_true",
+                        help="stop the login service and keep it off")
+    toggle.add_argument("--enable", action="store_true",
+                        help="start the login service and run it at every login")
+    sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("list", help="show playlists")
     a = sub.add_parser("activate", help="activate a playlist now")
     a.add_argument("playlist", help="playlist name or id")
@@ -374,6 +396,14 @@ def main():
     w.add_argument("--light", required=True, help="playlist for the light theme")
     w.add_argument("--dark", required=True, help="playlist for the dark theme")
     args = ap.parse_args()
+
+    if args.enable or args.disable:
+        if args.cmd:
+            ap.error("--enable/--disable can't be combined with a command")
+        set_service(args.enable)
+        return
+    if not args.cmd:
+        ap.error("choose a command (list, activate, watch) or --enable/--disable")
 
     try:
         if args.cmd == "list":
